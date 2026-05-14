@@ -8,17 +8,17 @@ on:
   workflow_dispatch:
 
 env:
-  ANDROID_HOME:          /usr/local/lib/android/sdk
-  ANDROID_SDK_ROOT:      /usr/local/lib/android/sdk
-  ANDROIDSDK:            /usr/local/lib/android/sdk
-  ANDROIDNDK:            /usr/local/lib/android/sdk/ndk/25.1.8937393
-  ANDROID_NDK_HOME:      /usr/local/lib/android/sdk/ndk/25.1.8937393
-  ANDROIDAPI:            "33"
-  ANDROIDMINAPI:         "26"
-  ANDROIDNDKAPI:         "26"
-  ANDROID_NDK_VERSION:   "25.1.8937393"
-  TARGET_BT:             "33.0.0"
-  GRADLE_OPTS:           "-Dorg.gradle.daemon=false"
+  ANDROID_HOME:        /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT:    /usr/local/lib/android/sdk
+  ANDROIDSDK:          /usr/local/lib/android/sdk
+  ANDROIDNDK:          /usr/local/lib/android/sdk/ndk/25.1.8937393
+  ANDROID_NDK_HOME:    /usr/local/lib/android/sdk/ndk/25.1.8937393
+  ANDROIDAPI:          "33"
+  ANDROIDMINAPI:       "26"
+  ANDROIDNDKAPI:       "26"
+  ANDROID_NDK_VERSION: "25.1.8937393"
+  TARGET_BT:           "33.0.0"
+  GRADLE_OPTS:         "-Dorg.gradle.daemon=false"
 
 jobs:
   build-apk:
@@ -61,34 +61,98 @@ jobs:
           pip install "buildozer==1.5.0"
           buildozer --version
 
+      # ======================================================================
+      # LOCATE OR INSTALL sdkmanager
+      #
+      # Probes all known paths on the ubuntu-22.04 runner image in order.
+      # If none exist, downloads cmdline-tools directly from Google.
+      # Exports SDK_MANAGER so every later step uses the same binary.
+      # ======================================================================
+      - name: Locate or install sdkmanager
+        run: |
+          locate_sdkmanager() {
+            # Priority 1 — cmdline-tools/latest  (most common on 22.04)
+            if [ -f "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+              echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+              return
+            fi
+            # Priority 2 — any versioned cmdline-tools subfolder
+            local found
+            found=$(ls "$ANDROID_HOME/cmdline-tools/" 2>/dev/null \
+                    | grep -v latest \
+                    | sort -rV \
+                    | head -1)
+            if [ -n "$found" ] && \
+               [ -f "$ANDROID_HOME/cmdline-tools/$found/bin/sdkmanager" ]; then
+              echo "$ANDROID_HOME/cmdline-tools/$found/bin/sdkmanager"
+              return
+            fi
+            # Priority 3 — legacy tools/bin location
+            if [ -f "$ANDROID_HOME/tools/bin/sdkmanager" ]; then
+              echo "$ANDROID_HOME/tools/bin/sdkmanager"
+              return
+            fi
+            echo ""
+          }
+
+          SDK_MGR=$(locate_sdkmanager)
+
+          if [ -z "$SDK_MGR" ]; then
+            echo "sdkmanager not found — downloading cmdline-tools..."
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            wget -q \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+              -O /tmp/cmdline-tools.zip
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-unpack
+            mv /tmp/cmdline-unpack/cmdline-tools \
+               "$ANDROID_HOME/cmdline-tools/latest"
+            SDK_MGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            echo "Installed sdkmanager at: $SDK_MGR"
+          else
+            echo "Found sdkmanager at: $SDK_MGR"
+          fi
+
+          echo "SDK_MANAGER=$SDK_MGR" >> "$GITHUB_ENV"
+
       - name: Accept all Android SDK licenses
         run: |
-          yes | sdkmanager --licenses 2>/dev/null || true
-          yes | sdkmanager --licenses 2>/dev/null || true
+          yes | "$SDK_MANAGER" --licenses 2>/dev/null || true
+          yes | "$SDK_MANAGER" --licenses 2>/dev/null || true
 
       - name: Install Build-Tools 33.0.0 and Platform 33
         run: |
-          sdkmanager \
+          "$SDK_MANAGER" \
             "platform-tools" \
             "build-tools;33.0.0" \
             "platforms;android-33"
 
-      - name: Create symlink 37.0.0 → 33.0.0 (symlink trick)
+      # ======================================================================
+      # SYMLINK TRICK
+      # Any tool that hard-codes build-tools/37.0.0 transparently gets
+      # the stable v33 binaries via this symlink.
+      # ======================================================================
+      - name: Symlink build-tools 37.0.0 → 33.0.0
         run: |
           BT_DIR="$ANDROID_HOME/build-tools"
-          echo "Build-tools directory before symlink:"
+          echo "Build-tools before:"
           ls "$BT_DIR"
 
-          sudo rm -rf "$BT_DIR/37.0.0" "$BT_DIR/37.0.0-rc1" "$BT_DIR/37.0.0-rc3"
+          sudo rm -rf \
+            "$BT_DIR/37.0.0" \
+            "$BT_DIR/37.0.0-rc1" \
+            "$BT_DIR/37.0.0-rc3"
+
           sudo ln -sf "$BT_DIR/33.0.0" "$BT_DIR/37.0.0"
 
-          echo ""
-          echo "Build-tools directory after symlink:"
+          echo "Build-tools after:"
           ls -la "$BT_DIR"
-          echo ""
-          echo "Symlink target:"
-          readlink -f "$BT_DIR/37.0.0"
+          echo "Symlink resolves to: $(readlink -f "$BT_DIR/37.0.0")"
 
+      # ======================================================================
+      # PATH INJECTION
+      # Build-Tools 33 is prepended so aidl, d8, apksigner always
+      # resolve from v33 regardless of what Buildozer appends later.
+      # ======================================================================
       - name: Inject Build-Tools 33.0.0 first in PATH
         run: |
           echo "$ANDROID_HOME/build-tools/33.0.0" >> "$GITHUB_PATH"
@@ -98,11 +162,14 @@ jobs:
         run: |
           which aidl
           aidl --version || true
-          echo "aidl binary: $(readlink -f $(which aidl))"
+          echo "aidl resolves to: $(readlink -f "$(which aidl)")"
 
+      # ======================================================================
+      # NDK r25b (25.1.8937393)
+      # ======================================================================
       - name: Install NDK 25.1.8937393 (r25b)
         run: |
-          sdkmanager "ndk;25.1.8937393"
+          "$SDK_MANAGER" "ndk;25.1.8937393"
 
       - name: Verify NDK
         run: |
@@ -126,12 +193,16 @@ jobs:
           echo "=== Java ===" && java -version
           echo "=== Python ===" && python --version
           echo "=== Buildozer ===" && buildozer --version
+          echo "=== sdkmanager ===" && echo "$SDK_MANAGER"
           echo "=== aidl ===" && which aidl && aidl --version || true
           echo "=== ANDROID_HOME ===" && echo "$ANDROID_HOME"
           echo "=== ANDROIDNDK ===" && echo "$ANDROIDNDK"
           echo "=== Build-tools ===" && ls "$ANDROID_HOME/build-tools/"
-          echo "=== NDK entries ===" && ls "$ANDROID_HOME/ndk/" 2>/dev/null || true
+          echo "=== NDK ===" && ls "$ANDROID_HOME/ndk/" 2>/dev/null || true
 
+      # ======================================================================
+      # BUILD — all env vars re-declared at process level
+      # ======================================================================
       - name: Build debug APK
         env:
           ANDROID_HOME:     /usr/local/lib/android/sdk
