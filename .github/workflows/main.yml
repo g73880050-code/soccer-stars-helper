@@ -1,64 +1,45 @@
 name: Build Soccer Stars Analyzer APK
 
-# ---------------------------------------------------------------------------
-# Trigger
-# ---------------------------------------------------------------------------
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
-  workflow_dispatch:        # allow manual trigger from Actions tab
+  workflow_dispatch:
 
-# ---------------------------------------------------------------------------
-# SDK / NDK versions — change ONLY here; propagate everywhere below
-# ---------------------------------------------------------------------------
 env:
-  BT_VERSION:   "33.0.0"          # Build-Tools — LOCKED, blocks auto-37 trap
-  API_LEVEL:    "33"               # Target API
-  MIN_API:      "26"               # Minimum API (Android 8.0)
-  NDK_VERSION:  "r25b"             # NDK release tag
-  NDK_FULL:     "android-ndk-r25b" # Extracted directory name
-  JAVA_DIST:    "temurin"          # JDK distribution
-  JAVA_VERSION: "17"
-
-  # Absolute SDK / NDK roots — every tool reads these
-  ANDROID_HOME:     ${{ github.workspace }}/.android/sdk
-  ANDROID_SDK_ROOT: ${{ github.workspace }}/.android/sdk
-  ANDROIDSDK:       ${{ github.workspace }}/.android/sdk
-  ANDROIDNDK:       ${{ github.workspace }}/.android/ndk/android-ndk-r25b
-  ANDROIDAPI:       "33"
-  ANDROIDMINAPI:    "26"
-  ANDROIDNDKAPI:    "26"
+  ANDROID_HOME:          /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT:      /usr/local/lib/android/sdk
+  ANDROIDSDK:            /usr/local/lib/android/sdk
+  ANDROIDNDK:            /usr/local/lib/android/sdk/ndk/25.1.8937393
+  ANDROID_NDK_HOME:      /usr/local/lib/android/sdk/ndk/25.1.8937393
+  ANDROIDAPI:            "33"
+  ANDROIDMINAPI:         "26"
+  ANDROIDNDKAPI:         "26"
+  ANDROID_NDK_VERSION:   "25.1.8937393"
+  TARGET_BT:             "33.0.0"
+  GRADLE_OPTS:           "-Dorg.gradle.daemon=false"
 
 jobs:
   build-apk:
-    # -----------------------------------------------------------------------
-    # Pin to 22.04 — glibc 2.35, stable with NDK r25b.
-    # ubuntu-latest is now 24.04 which has libtinfo5 / glibc mismatches.
-    # -----------------------------------------------------------------------
     runs-on: ubuntu-22.04
 
     steps:
 
-      # ======================================================================
-      # STAGE 1 — Environment setup
-      # ======================================================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version:  17
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
-      - name: Set up Java ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: ${{ env.JAVA_DIST }}
-          java-version:  ${{ env.JAVA_VERSION }}
 
       - name: Install system packages
         run: |
@@ -70,118 +51,69 @@ jobs:
             zlib1g-dev \
             libncurses6 libncursesw6 \
             libssl-dev libffi-dev \
-            libsqlite3-dev libgdbm-dev \
+            libsqlite3-dev \
             build-essential ccache cmake ninja-build gettext
 
-      # ======================================================================
-      # STAGE 2 — Python toolchain (Buildozer strictly pinned to 1.5.0)
-      # ======================================================================
-
-      - name: Install Buildozer 1.5.0 + Cython
+      - name: Install Buildozer 1.5.0 and Cython
         run: |
           pip install --upgrade pip wheel setuptools
           pip install "cython==3.0.10"
           pip install "buildozer==1.5.0"
           buildozer --version
 
-      # ======================================================================
-      # STAGE 3 — Android SDK  (we install it; Buildozer must not touch it)
-      # ======================================================================
-
-      - name: Cache Android SDK
-        id: cache-sdk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.android/sdk
-          key: android-sdk-bt${{ env.BT_VERSION }}-api${{ env.API_LEVEL }}-v2
-
-      - name: Install Android command-line tools
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          wget -q \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-            -O /tmp/cmdline-tools.zip
-          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-unpack
-          mv /tmp/cmdline-unpack/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
-
       - name: Accept all Android SDK licenses
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          yes | sdkmanager --licenses 2>/dev/null || true
+          yes | sdkmanager --licenses 2>/dev/null || true
 
-      - name: Install SDK — Build-Tools ${{ env.BT_VERSION }} + Platform ${{ env.API_LEVEL }}
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
+      - name: Install Build-Tools 33.0.0 and Platform 33
         run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+          sdkmanager \
             "platform-tools" \
-            "build-tools;${{ env.BT_VERSION }}" \
-            "platforms;android-${{ env.API_LEVEL }}"
+            "build-tools;33.0.0" \
+            "platforms;android-33"
 
-      # ======================================================================
-      # STAGE 4 — Nuke Build-Tools 37 (the version-upgrade trap)
-      #
-      # p4a / Gradle sometimes auto-pull the latest build-tools even when
-      # the spec is pinned.  We destroy any 37.x directory before the build
-      # and re-confirm aidl is reachable from version 33.
-      # ======================================================================
-
-      - name: Block Build-Tools 37 — remove any 37.x directories
+      - name: Create symlink 37.0.0 → 33.0.0 (symlink trick)
         run: |
-          for bt37 in \
-            "$ANDROID_HOME/build-tools/37.0.0" \
-            "$ANDROID_HOME/build-tools/37.0.0-rc1" \
-            "$ANDROID_HOME/build-tools/37.0.0-rc3"; do
-            [ -d "$bt37" ] && { echo "Removing $bt37"; rm -rf "$bt37"; } || true
-          done
-          echo "Build-tools available after cleanup:"
-          ls "$ANDROID_HOME/build-tools/" 2>/dev/null || echo "  (none yet)"
+          BT_DIR="$ANDROID_HOME/build-tools"
+          echo "Build-tools directory before symlink:"
+          ls "$BT_DIR"
 
-      - name: Verify aidl in Build-Tools ${{ env.BT_VERSION }}
+          sudo rm -rf "$BT_DIR/37.0.0" "$BT_DIR/37.0.0-rc1" "$BT_DIR/37.0.0-rc3"
+          sudo ln -sf "$BT_DIR/33.0.0" "$BT_DIR/37.0.0"
+
+          echo ""
+          echo "Build-tools directory after symlink:"
+          ls -la "$BT_DIR"
+          echo ""
+          echo "Symlink target:"
+          readlink -f "$BT_DIR/37.0.0"
+
+      - name: Inject Build-Tools 33.0.0 first in PATH
         run: |
-          AIDL="$ANDROID_HOME/build-tools/${{ env.BT_VERSION }}/aidl"
-          [ -f "$AIDL" ] || { echo "ERROR: aidl missing at $AIDL"; exit 1; }
-          echo "aidl OK → $AIDL"
-          "$AIDL" --version || true
+          echo "$ANDROID_HOME/build-tools/33.0.0" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools"      >> "$GITHUB_PATH"
 
-      # Prepend BT 33 to PATH — this step persists for all subsequent steps
-      - name: Prepend Build-Tools ${{ env.BT_VERSION }} to PATH
+      - name: Verify aidl is reachable
         run: |
-          echo "$ANDROID_HOME/build-tools/${{ env.BT_VERSION }}" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools"                    >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin"          >> "$GITHUB_PATH"
+          which aidl
+          aidl --version || true
+          echo "aidl binary: $(readlink -f $(which aidl))"
 
-      # ======================================================================
-      # STAGE 5 — Android NDK r25b
-      # ======================================================================
-
-      - name: Cache Android NDK ${{ env.NDK_VERSION }}
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.android/ndk
-          key: android-ndk-${{ env.NDK_VERSION }}-v1
-
-      - name: Install Android NDK ${{ env.NDK_VERSION }}
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
+      - name: Install NDK 25.1.8937393 (r25b)
         run: |
-          mkdir -p "${{ github.workspace }}/.android/ndk"
-          wget -q \
-            https://dl.google.com/android/repository/${{ env.NDK_FULL }}-linux.zip \
-            -O /tmp/ndk.zip
-          unzip -q /tmp/ndk.zip -d "${{ github.workspace }}/.android/ndk"
+          sdkmanager "ndk;25.1.8937393"
 
       - name: Verify NDK
         run: |
-          [ -f "$ANDROIDNDK/ndk-build" ] \
-            || { echo "ERROR: ndk-build not found in $ANDROIDNDK"; exit 1; }
-          echo "NDK OK → $ANDROIDNDK"
+          if [ ! -f "$ANDROIDNDK/ndk-build" ]; then
+            echo "ERROR: ndk-build not found at $ANDROIDNDK"
+            ls "$ANDROID_HOME/ndk/" || true
+            exit 1
+          fi
+          echo "NDK OK: $ANDROIDNDK"
 
-      # ======================================================================
-      # STAGE 6 — Buildozer recipe cache (app layer only)
-      # ======================================================================
-
-      - name: Cache Buildozer compiled recipes
+      - name: Cache Buildozer app recipes
         uses: actions/cache@v4
         with:
           path: .buildozer/android/app
@@ -189,47 +121,32 @@ jobs:
           restore-keys: |
             buildozer-app-${{ runner.os }}-
 
-      # ======================================================================
-      # STAGE 7 — Pre-build sanity check
-      # ======================================================================
-
       - name: Pre-build environment check
         run: |
-          echo "=== Java ==="  && java -version
+          echo "=== Java ===" && java -version
           echo "=== Python ===" && python --version
           echo "=== Buildozer ===" && buildozer --version
-          echo "=== aidl in PATH ===" && which aidl && aidl --version || true
-          echo "=== ANDROIDSDK ===" && echo "$ANDROIDSDK"
+          echo "=== aidl ===" && which aidl && aidl --version || true
+          echo "=== ANDROID_HOME ===" && echo "$ANDROID_HOME"
           echo "=== ANDROIDNDK ===" && echo "$ANDROIDNDK"
-          echo "=== Build-tools present ==="
-          ls "$ANDROID_HOME/build-tools/"
-
-      # ======================================================================
-      # STAGE 8 — Build
-      #
-      # All SDK/NDK env vars are re-stated here as a hard guarantee.
-      # Even if Buildozer internally resets them, these process-level
-      # exports take precedence for every child process it spawns.
-      # ======================================================================
+          echo "=== Build-tools ===" && ls "$ANDROID_HOME/build-tools/"
+          echo "=== NDK entries ===" && ls "$ANDROID_HOME/ndk/" 2>/dev/null || true
 
       - name: Build debug APK
-        working-directory: .
         env:
-          ANDROID_HOME:     ${{ github.workspace }}/.android/sdk
-          ANDROID_SDK_ROOT: ${{ github.workspace }}/.android/sdk
-          ANDROIDSDK:       ${{ github.workspace }}/.android/sdk
-          ANDROIDNDK:       ${{ github.workspace }}/.android/ndk/android-ndk-r25b
+          ANDROID_HOME:     /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROIDSDK:       /usr/local/lib/android/sdk
+          ANDROIDNDK:       /usr/local/lib/android/sdk/ndk/25.1.8937393
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.1.8937393
           ANDROIDAPI:       "33"
           ANDROIDMINAPI:    "26"
           ANDROIDNDKAPI:    "26"
+          GRADLE_OPTS:      "-Dorg.gradle.daemon=false"
         run: |
           buildozer -v android debug 2>&1 | tee buildozer_build.log
 
-      # ======================================================================
-      # STAGE 9 — Artifacts
-      # ======================================================================
-
-      - name: Upload APK
+      - name: Upload APK artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -246,4 +163,3 @@ jobs:
           path: ./buildozer_build.log
           retention-days: 7
           if-no-files-found: ignore
-
